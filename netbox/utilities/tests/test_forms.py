@@ -20,7 +20,7 @@ from utilities.forms.fields.dynamic import (
     DynamicMultipleChoiceField,
 )
 from utilities.forms.fields.generic import GenericObjectChoiceField
-from utilities.forms.forms import BulkRenameForm
+from utilities.forms.forms import BulkRenameForm, CSVModelForm
 from utilities.forms.mixins import GenericObjectFormMixin
 from utilities.forms.rendering import FieldSet
 from utilities.forms.utils import (
@@ -1155,3 +1155,103 @@ class DescriptionSelectTestCase(TestCase):
         self.assertTrue(calls)
         # And descriptions are still collected as normal
         self.assertEqual(field.widget.descriptions, {self.ExampleChoices.FOO: 'Description of foo'})
+
+
+class CSVModelFormHeaderTranslationTestCase(TestCase):
+    """
+    Validate that CSVModelForm translates human-readable column headers (such as those produced by a
+    CSV export, which uses each field's label) back to their corresponding field names, so that a file
+    exported from an object table can be re-imported without manually renaming its headers.
+    """
+
+    class SiteCSVForm(CSVModelForm):
+        # Explicit labels mirror the real import forms (e.g. SiteImportForm), whose labels match the
+        # title-cased column headers produced on export.
+        status = forms.CharField(label='Status', required=False)
+        physical_address = forms.CharField(label='Physical Address', required=False)
+        time_zone = forms.CharField(label='Time Zone', required=False)
+
+        class Meta:
+            model = Site
+            fields = ('name', 'slug', 'status', 'physical_address', 'time_zone')
+
+    def _make_form(self, data, headers):
+        return self.SiteCSVForm(data=data, headers=headers)
+
+    def test_export_labels_translated_to_field_names(self):
+        """Headers matching field labels are rewritten to the corresponding field names."""
+        headers = {'Name': None, 'Status': None, 'Physical Address': None, 'Time Zone': None}
+        data = {'Name': 'HQ', 'Status': 'active', 'Physical Address': '1 Main St', 'Time Zone': 'UTC'}
+        form = self._make_form(data, headers)
+
+        self.assertEqual(set(form.headers), {'name', 'status', 'physical_address', 'time_zone'})
+
+    def test_translated_data_keys_remain_reachable(self):
+        """After translation the submitted values are reachable under the field-name keys."""
+        headers = {'Physical Address': None, 'Time Zone': None}
+        data = {'Physical Address': '1 Main St', 'Time Zone': 'UTC'}
+        form = self._make_form(data, headers)
+
+        self.assertEqual(form.data.get('physical_address'), '1 Main St')
+        self.assertEqual(form.data.get('time_zone'), 'UTC')
+
+    def test_label_matching_is_case_insensitive(self):
+        """A header is matched to a label regardless of case or surrounding whitespace."""
+        headers = {'  STATUS  ': None}
+        data = {'  STATUS  ': 'active'}
+        form = self._make_form(data, headers)
+
+        self.assertIn('status', form.headers)
+        self.assertEqual(form.data.get('status'), 'active')
+
+    def test_field_name_headers_are_left_unchanged(self):
+        """Headers that already match a field name are not altered."""
+        headers = {'name': None, 'status': None, 'physical_address': None}
+        data = {'name': 'HQ', 'status': 'active', 'physical_address': '1 Main St'}
+        form = self._make_form(data, headers)
+
+        self.assertEqual(set(form.headers), {'name', 'status', 'physical_address'})
+
+    def test_unrecognized_header_is_preserved_and_reported(self):
+        """A header that matches neither a field name nor a label is preserved and rejected by clean()."""
+        headers = {'name': None, 'Bogus Column': None}
+        data = {'name': 'HQ', 'Bogus Column': 'x'}
+        form = self._make_form(data, headers)
+
+        self.assertIn('Bogus Column', form.headers)
+        self.assertFalse(form.is_valid())
+        self.assertTrue(
+            any('Unrecognized header' in str(e) for e in form.non_field_errors())
+        )
+
+    def test_translation_preserves_to_field_accessor(self):
+        """A dotted accessor on a translated header (e.g. 'Region.name') keeps its to_field mapping."""
+        class SiteWithRegionCSVForm(CSVModelForm):
+            region = forms.ModelChoiceField(
+                label='Region',
+                queryset=Site.objects.none(),
+                required=False,
+            )
+
+            class Meta:
+                model = Site
+                fields = ('name', 'region')
+
+        headers = {'Name': None, 'Region': 'name'}
+        data = {'Name': 'HQ', 'Region': 'us-east'}
+        form = SiteWithRegionCSVForm(data=data, headers=headers)
+
+        self.assertIn('region', form.headers)
+        self.assertEqual(form.headers['region'], 'name')
+        self.assertEqual(form.fields['region'].to_field_name, 'name')
+
+    def test_translation_skips_when_field_name_header_already_present(self):
+        """A label-style header is not translated if its field name is already used as a header."""
+        # Both the field name 'status' and its label 'Status' are present; the label must not collide.
+        headers = {'status': None, 'Status': None}
+        data = {'status': 'active', 'Status': 'planned'}
+        form = self._make_form(data, headers)
+
+        # 'status' (field name) is preserved; 'Status' is left untranslated (and will be flagged by clean())
+        self.assertIn('status', form.headers)
+        self.assertIn('Status', form.headers)

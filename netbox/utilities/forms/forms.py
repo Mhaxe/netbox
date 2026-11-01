@@ -125,10 +125,75 @@ class CSVModelForm(forms.ModelForm):
         self.headers = headers or {}
         super().__init__(*args, **kwargs)
 
+        # Translate any human-readable column headers (e.g. those produced by a CSV export, which uses each
+        # field's label) back to their corresponding field names. This allows a file exported from the object
+        # table to be re-imported without manually renaming its headers. Only headers which do not already match
+        # a field name are considered, so existing (field-name) headers are never altered.
+        self._translate_header_labels()
+
         # Modify the model form to accommodate any customized to_field_name properties
         for field, to_field in self.headers.items():
-            if to_field is not None:
+            if to_field is not None and field in self.fields:
                 self.fields[field].to_field_name = to_field
+
+    def _build_label_map(self):
+        """
+        Return a mapping of {normalized field label: field name} for all fields on the form. Labels which map
+        to more than one field are omitted to avoid ambiguous translation.
+        """
+        label_map = {}
+        ambiguous = set()
+        for name, field in self.fields.items():
+            label = field.label
+            if not label:
+                continue
+            key = str(label).strip().lower()
+            if key in label_map and label_map[key] != name:
+                ambiguous.add(key)
+            else:
+                label_map[key] = name
+        for key in ambiguous:
+            label_map.pop(key, None)
+        return label_map
+
+    def _translate_header_labels(self):
+        """
+        Rewrite any CSV header which matches a field's label (rather than its field name) so that it maps to the
+        corresponding field name. This mutates both ``self.headers`` and the bound ``self.data`` in place.
+        """
+        if not self.headers:
+            return
+
+        label_map = self._build_label_map()
+        renames = {}
+        for header in self.headers:
+            # Leave headers which already correspond to a real field untouched
+            if header in self.fields:
+                continue
+            translated = label_map.get(str(header).strip().lower())
+            # Only translate to a field name not already present as a header, to avoid collisions
+            if translated and translated != header and translated not in self.headers:
+                renames[header] = translated
+
+        if not renames:
+            return
+
+        # Rebuild the headers mapping, preserving the original to_field for each translated header
+        self.headers = {
+            renames.get(header, header): to_field
+            for header, to_field in self.headers.items()
+        }
+
+        # Mirror the renames onto the bound data (a QueryDict or dict of {header: value})
+        if self.data:
+            try:
+                data = self.data.copy()
+            except AttributeError:
+                data = dict(self.data)
+            for old_header, new_header in renames.items():
+                if old_header in data and new_header not in data:
+                    data[new_header] = data.pop(old_header)
+            self.data = data
 
     def clean(self):
         # Flag any invalid CSV headers
